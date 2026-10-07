@@ -1,0 +1,124 @@
+# Build, test, scan and publish podinfo, then hand the new image over to
+# Argo CD by bumping its tag in the GitOps repository.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+# Least privilege by default; jobs widen it only where needed.
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/tarikaziki/podinfo
+  GITOPS_REPO: TarikAZIKI/aws-k3s-gitops-platform
+  GITOPS_FILE: gitops/apps/podinfo.yaml
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # Third-party actions are pinned to a commit SHA: a moved tag cannot
+      # inject different code into the pipeline.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit tests
+        run: go test ./...
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Compute the image tag
+        id: meta
+        run: echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Build locally first: the image is only pushed once the scan has passed.
+      - name: Build the image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          push: false
+          tags: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+          build-args: REVISION=${{ github.sha }}
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan the image with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push the image
+        if: github.event_name == 'push'
+        run: docker push "$IMAGE:${{ steps.meta.outputs.tag }}"
+
+  deploy:
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    # One deployment at a time, so two bumps never race on the GitOps repo.
+    concurrency:
+      group: gitops-podinfo
+      cancel-in-progress: false
+    steps:
+      # The deploy key only has write access to the GitOps repository.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          ssh-key: ${{ secrets.GITOPS_DEPLOY_KEY }}
+
+      - name: Bump the image in the GitOps repository
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          yq -i '
+            .spec.source.helm.valuesObject.image.repository = strenv(IMAGE) |
+            .spec.source.helm.valuesObject.image.tag = strenv(TAG)
+          ' "$GITOPS_FILE"
+          git diff --stat
+
+      - name: Commit and push
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "Image already deployed, nothing to do."
+            exit 0
+          fi
+          git commit -am "Déploiement de podinfo ${TAG}"
+          git push
